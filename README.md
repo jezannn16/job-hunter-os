@@ -14,6 +14,7 @@
 | --- | --- |
 | Applications | Add manually or import vacancy text; filter and export CSV or Markdown |
 | History | Track constrained status changes, notes, interview dates, and follow-up tasks |
+| Reminders | List due follow-ups; `reminders --record` is safe to run repeatedly and records one local-day reminder per task |
 | Resume evidence | Compare a vacancy with a local resume file and show matching snippets |
 | Vacancy search | Read-only public HH.ru search; saving results is an explicit option |
 | Storage | Local SQLite database; no account or API key required |
@@ -40,6 +41,7 @@ python job_hunter.py --db /tmp/jobs-demo.sqlite3 dashboard
 printf 'Python and SQL experience in ETL projects.\n' > /tmp/resume-demo.txt
 python job_hunter.py --db /tmp/jobs-demo.sqlite3 match 1 /tmp/resume-demo.txt
 python job_hunter.py --db /tmp/jobs-demo.sqlite3 export-md
+python job_hunter.py --db /tmp/jobs-demo.sqlite3 reminders
 ```
 
 The match output includes evidence snippets for Python and SQL and lists Docker as unmentioned. Data remains in the local database; resume files are read locally.
@@ -73,6 +75,6 @@ Network availability and HH.ru policy can affect that optional check. It does no
 
 Vacancy descriptions and saved resume versions are stored as plain text in SQLite. Keep sensitive information out of shared or unencrypted databases. The database is single-user and local; it is not encrypted.
 
-There is no auto-apply, website scraping, outbound messaging, calendar integration, or scheduled reminder delivery. Follow-ups and interviews are stored and shown by CLI commands. Matching supports a deliberately small Russian/English skill vocabulary.
+There is no auto-apply, website scraping, outbound messaging, or external calendar integration. `reminders` prints follow-ups due in their saved timezone; `reminders --record` records a single reminder per task and local calendar day, so a local scheduler can invoke it repeatedly without duplicate reminders. `followup-complete ID` closes a task. The command does not send notifications outside the terminal. Matching supports a deliberately small Russian/English skill vocabulary.
 
 See [demo steps](docs/demo.md) for the synthetic walkthrough.

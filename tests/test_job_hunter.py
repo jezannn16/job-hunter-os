@@ -1,9 +1,19 @@
 import json
+from datetime import datetime
 from unittest.mock import patch
 
 import pytest
 
-from job_hunter import HHSource, add_vacancy, connect, list_vacancies, match_resume, set_status
+from job_hunter import (
+    HHSource,
+    add_vacancy,
+    complete_followup,
+    connect,
+    due_reminders,
+    list_vacancies,
+    match_resume,
+    set_status,
+)
 
 
 def test_status_history_and_search(tmp_path):
@@ -33,6 +43,33 @@ def test_status_transition_is_constrained_and_audited(tmp_path):
     with pytest.raises(ValueError, match="Cannot move"):
         set_status(db, vacancy, "offer")
     assert db.execute("select count(*) from status_history").fetchone()[0] == 1
+
+
+def test_followup_reminders_are_timezone_aware_daily_idempotent_and_completable(tmp_path):
+    db = connect(tmp_path / "jobs.db")
+    vacancy = add_vacancy(db, "Engineer", "Acme")
+    app_id = db.execute("select id from applications where vacancy_id=?", (vacancy,)).fetchone()[0]
+    task_id = db.execute(
+        "insert into follow_up_tasks(application_id,due_at,note) values(?,?,?)",
+        (app_id, "2026-03-29T01:30:00+01:00", "Review interview notes"),
+    ).lastrowid
+    now_at = datetime.fromisoformat("2026-03-29T03:15:00+02:00")
+
+    assert due_reminders(db, now_at) [0]["id"] == task_id
+    assert due_reminders(db, now_at, record=True)[0]["note"] == "Review interview notes"
+    assert due_reminders(db, now_at, record=True) == []
+    next_day = datetime.fromisoformat("2026-03-30T09:00:00+02:00")
+    assert len(due_reminders(db, next_day, record=True)) == 1
+    complete_followup(db, task_id)
+    assert due_reminders(db, next_day, record=True) == []
+    with pytest.raises(ValueError, match="Pending follow-up"):
+        complete_followup(db, task_id)
+
+
+def test_due_reminder_rejects_naive_clock(tmp_path):
+    db = connect(tmp_path / "jobs.db")
+    with pytest.raises(ValueError, match="timezone"):
+        due_reminders(db, datetime(2026, 1, 1))
 
 
 def test_match_is_evidence_based_and_bilingual():

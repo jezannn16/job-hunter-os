@@ -61,6 +61,8 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
       starts_at TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS follow_up_tasks(id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
       due_at TEXT NOT NULL, note TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS follow_up_reminders(task_id INTEGER NOT NULL REFERENCES follow_up_tasks(id) ON DELETE CASCADE,
+      reminder_date TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(task_id,reminder_date));
     CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
       body TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_vacancy_title ON vacancies(title);
@@ -109,6 +111,51 @@ def set_status(db: sqlite3.Connection, vacancy_id: int, status: str) -> None:
         "INSERT INTO status_history(application_id,old_status,new_status,changed_at) VALUES(?,?,?,?)",
         (app["id"], app["status"], status, stamp),
     )
+
+
+def due_reminders(db: sqlite3.Connection, at: datetime | None = None, record: bool = False) -> list[dict[str, object]]:
+    """Return due follow-ups; optional daily recording makes repeated scheduler runs idempotent."""
+    now_at = at or datetime.now(UTC)
+    if now_at.utcoffset() is None:
+        raise ValueError("Reminder time must include a timezone")
+    rows = db.execute(
+        """SELECT f.id,f.due_at,f.note,v.title,c.name company
+           FROM follow_up_tasks f JOIN applications a ON a.id=f.application_id
+           JOIN vacancies v ON v.id=a.vacancy_id JOIN companies c ON c.id=v.company_id
+           WHERE f.completed=0 ORDER BY f.due_at,f.id"""
+    ).fetchall()
+    reminders = []
+    for row in rows:
+        due_at = datetime.fromisoformat(row["due_at"])
+        if due_at.utcoffset() is None:
+            continue
+        local_now = now_at.astimezone(due_at.tzinfo)
+        if due_at > local_now:
+            continue
+        reminder_date = local_now.date().isoformat()
+        key = (row["id"], reminder_date)
+        if db.execute(
+            "SELECT 1 FROM follow_up_reminders WHERE task_id=? AND reminder_date=?", key
+        ).fetchone():
+            continue
+        reminders.append(
+            {
+                "id": row["id"], "due_at": due_at.isoformat(), "note": row["note"],
+                "title": row["title"], "company": row["company"],
+            }
+        )
+        if record:
+            db.execute(
+                "INSERT OR IGNORE INTO follow_up_reminders(task_id,reminder_date,recorded_at) VALUES(?,?,?)",
+                (row["id"], reminder_date, now_at.astimezone(UTC).isoformat(timespec="seconds")),
+            )
+    return reminders
+
+
+def complete_followup(db: sqlite3.Connection, task_id: int) -> None:
+    changed = db.execute("UPDATE follow_up_tasks SET completed=1 WHERE id=? AND completed=0", (task_id,)).rowcount
+    if not changed:
+        raise ValueError("Pending follow-up not found")
 
 
 def list_vacancies(db: sqlite3.Connection, query: str = "", status: str = "") -> list[sqlite3.Row]:
@@ -241,6 +288,10 @@ def main() -> int:
     p.add_argument("due_at")
     p.add_argument("note")
     sub.add_parser("followups")
+    p = sub.add_parser("reminders", help="List due follow-ups; --record enables once-per-local-day deduplication")
+    p.add_argument("--record", action="store_true")
+    p = sub.add_parser("followup-complete")
+    p.add_argument("id", type=int)
     sub.add_parser("interviews")
     p = sub.add_parser("backup")
     p.add_argument("file")
@@ -345,6 +396,16 @@ def main() -> int:
                 print(f"{state} {row['due_at']} — {row['company']} / {row['title']}: {row['note']}")
             if not rows:
                 print("No pending follow-ups")
+        elif args.cmd == "reminders":
+            rows = due_reminders(db, record=args.record)
+            for row in rows:
+                print(f"REMINDER #{row['id']} {row['due_at']} — {row['company']} / {row['title']}: {row['note']}")
+            if not rows:
+                print("No new due reminders")
+            db.commit()
+        elif args.cmd == "followup-complete":
+            complete_followup(db, args.id)
+            print("Follow-up completed")
         elif args.cmd == "interviews":
             rows = db.execute(
                 "SELECT i.starts_at,i.notes,v.title,c.name company FROM interview_events i JOIN applications a ON a.id=i.application_id JOIN vacancies v ON v.id=a.vacancy_id JOIN companies c ON c.id=v.company_id ORDER BY i.starts_at"
