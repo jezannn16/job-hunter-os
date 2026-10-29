@@ -1,39 +1,78 @@
 # Job Hunter OS
 
-Local-first job search CRM. Current MVP is a Python CLI backed by SQLite; it stores manual/imported vacancies, application status history, resume versions and interview/follow-up notes. HH.ru search is read-only and only runs when explicitly requested.
+![Job Hunter OS — application tracker banner with a vacancy timeline and resume evidence cards.](assets/banner.svg)
 
-## Implemented
+**A local-first tracker for applications, interviews, and follow-ups.** Keep a clear history of each application in SQLite, compare a vacancy with resume evidence, and optionally search public HH.ru vacancies.
 
-- Add vacancies manually or import description text from a UTF-8 file.
-- Search/filter saved vacancies, show a status-grouped dashboard, keep application status transitions in an audit history, and export CSV.
-- Compare vacancy description with a resume file using a small RU/EN skill vocabulary. Output includes exact resume snippets; unmentioned means unknown. Score is a heuristic overlap, never an offer probability.
-- Read-only HH.ru public vacancy search with page selection, an identifying User-Agent and an 8-second timeout. Manual storage works without credentials.
-- Save resume versions, interview events, follow-up tasks, and application notes in SQLite.
-- Delete a vacancy and its history or all vacancy/application records.
+[![CI](https://github.com/jezannn16/job-hunter-os/actions/workflows/ci.yml/badge.svg)](https://github.com/jezannn16/job-hunter-os/actions/workflows/ci.yml)
+
+[Features](#what-it-does) · [Quick start](#quick-start) · [HHru search](#search-hhru) · [Tests](#tests-and-ci) · [Data and scope](#data-and-scope)
+
+## What it does
+
+| Area | Available now |
+| --- | --- |
+| Applications | Add manually or import vacancy text; filter and export CSV or Markdown |
+| History | Track constrained status changes, notes, interview dates, and follow-up tasks |
+| Resume evidence | Compare a vacancy with a local resume file and show matching snippets |
+| Vacancy search | Read-only public HH.ru search; saving results is an explicit option |
+| Storage | Local SQLite database; no account or API key required |
+
+The resume score is a small vocabulary-overlap heuristic, not a suitability judgment or offer probability. Skills absent from the resume are reported as unmentioned, not as proof of lacking them.
 
 ## Quick start
 
+Requires Python 3.11 or newer.
+
 ```sh
-python3 -m venv .venv && . .venv/bin/activate
-python -m pip install pytest ruff
-python job_hunter.py --db jobs.sqlite3 add 'Data Engineer' 'Example Co' --url https://example.org/job --description 'Required: Python, SQL'
-python job_hunter.py --db jobs.sqlite3 list
-python job_hunter.py --db jobs.sqlite3 status 1 applied
-python job_hunter.py --db jobs.sqlite3 dashboard
-python job_hunter.py --db jobs.sqlite3 export > jobs.csv
-python job_hunter.py --db jobs.sqlite3 resume-add 'CV Oct 2026' resume.txt
-python job_hunter.py --db jobs.sqlite3 interview-add 1 '2026-11-04T14:00:00+03:00' --notes 'Technical round'
-python job_hunter.py --db jobs.sqlite3 followup-add 1 '2026-11-05T10:00:00+03:00' 'Ask for next steps'
-python job_hunter.py --db jobs.sqlite3 followups
-python job_hunter.py --db jobs.sqlite3 backup jobs-backup.sqlite3
-python job_hunter.py --db jobs.sqlite3 export-md > applications.md
-pytest -q
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[dev]'
 ```
 
-Search HH.ru: `python job_hunter.py hh-search 'аналитик данных' --page 0 --save`. The API is documented as `GET /vacancies`; anonymous search is available, while most user-specific methods require OAuth. See [HH.ru API vacancy documentation](https://github.com/hhru/api/blob/master/docs/vacancies.md) and [authorization documentation](https://github.com/hhru/api/blob/master/docs/authorization.md).
+Try a complete local workflow with a throwaway database:
 
-## Limitations / planned
+```sh
+python job_hunter.py --db /tmp/jobs-demo.sqlite3 add 'Data Engineer' 'Example Co' \
+  --url https://example.org/job --description 'Required: Python, SQL. Preferred: Docker.'
+python job_hunter.py --db /tmp/jobs-demo.sqlite3 status 1 applied
+python job_hunter.py --db /tmp/jobs-demo.sqlite3 dashboard
+printf 'Python and SQL experience in ETL projects.\n' > /tmp/resume-demo.txt
+python job_hunter.py --db /tmp/jobs-demo.sqlite3 match 1 /tmp/resume-demo.txt
+python job_hunter.py --db /tmp/jobs-demo.sqlite3 export-md
+```
 
-No website scraping, auto-apply, message sending, LLM, calendar UI, scheduled reminder delivery, XLSX import or sophisticated Russian morphology. Interview and follow-up records are stored and visible in CLI lists, but no scheduler notifies the user. A match only recognizes a deliberately short synonym set. Database is single-user local SQLite without encryption. Imported vacancy text and resume versions are stored in full; avoid sensitive personal data. HH search accepts one page number per call and keeps only a short in-process cache; the CLI exits after each command so repeated CLI calls do not share that cache. Request failures leave existing records untouched. No API credentials are needed for the implemented public search.
+The match output includes evidence snippets for Python and SQL and lists Docker as unmentioned. Data remains in the local database; resume files are read locally.
 
-See [demo steps](docs/demo.md) for a synthetic end-to-end walkthrough.
+## Search HH.ru
+
+Public vacancy search is a read-only anonymous request and needs no credentials. Search without saving results:
+
+```sh
+python job_hunter.py --db /tmp/jobs-demo.sqlite3 hh-search 'аналитик данных' --page 0
+```
+
+Add `--save` only when you want the returned vacancies stored in the selected database. The search uses one page per request and an identifying User-Agent. See the [HH.ru vacancy API](https://github.com/hhru/api/blob/master/docs/vacancies.md).
+
+## Tests and CI
+
+```sh
+pytest -q
+ruff check .
+```
+
+The default suite uses a temporary SQLite database and mocks the HH.ru HTTP response. An optional live smoke test checks the public search endpoint; it is read-only and skipped unless explicitly enabled:
+
+```sh
+RUN_LIVE_TESTS=1 pytest -q -m live
+```
+
+Network availability and HH.ru policy can affect that optional check. It does not save results.
+
+## Data and scope
+
+Vacancy descriptions and saved resume versions are stored as plain text in SQLite. Keep sensitive information out of shared or unencrypted databases. The database is single-user and local; it is not encrypted.
+
+There is no auto-apply, website scraping, outbound messaging, calendar integration, or scheduled reminder delivery. Follow-ups and interviews are stored and shown by CLI commands. Matching supports a deliberately small Russian/English skill vocabulary.
+
+See [demo steps](docs/demo.md) for the synthetic walkthrough.

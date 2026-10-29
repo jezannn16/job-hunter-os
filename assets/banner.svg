@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 380" role="img" aria-labelledby="title desc">
+  <title id="title">Job Hunter OS</title>
+  <desc id="desc">A local job-search tracker illustrated with an application timeline and resume evidence cards.</desc>
+  <defs>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#B7F36B" stop-opacity=".16"/>
+      <stop offset="1" stop-color="#B7F36B" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="380" rx="28" fill="#0B1020"/>
+  <path d="M0 290C180 210 300 370 490 285s310-96 465-12 190 53 245 20v87H0Z" fill="url(#glow)"/>
+  <circle cx="1110" cy="54" r="2" fill="#B7F36B" opacity=".7"/>
+  <circle cx="1067" cy="92" r="1.5" fill="#B7F36B" opacity=".45"/>
+  <text x="72" y="98" fill="#B7F36B" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="15" font-weight="700" letter-spacing="3">LOCAL-FIRST JOB SEARCH</text>
+  <text x="68" y="166" fill="#F4F7FB" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="54" font-weight="750" letter-spacing="-1.5">Job Hunter OS</text>
+  <text x="72" y="211" fill="#AAB5CA" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="21">Applications, interviews, and resume evidence.</text>
+  <rect x="72" y="253" width="218" height="40" rx="20" fill="#151D31" stroke="#293550"/>
+  <circle cx="94" cy="273" r="5" fill="#B7F36B"/>
+  <text x="110" y="279" fill="#DFE6F1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="14" font-weight="600">Your search, in one place</text>
+
+  <rect x="677" y="52" width="451" height="276" rx="20" fill="#151D31" stroke="#293550" stroke-width="1.5"/>
+  <text x="710" y="88" fill="#9CAAC1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="12" font-weight="700" letter-spacing="2">APPLICATION TIMELINE</text>
+  <path d="M735 125v152" fill="none" stroke="#45516B" stroke-width="2" stroke-dasharray="4 8"/>
+  <circle cx="735" cy="137" r="10" fill="#B7F36B"/>
+  <circle cx="735" cy="193" r="8" fill="#6C7891"/>
+  <circle cx="735" cy="249" r="8" fill="#6C7891"/>
+  <rect x="765" y="116" width="319" height="43" rx="10" fill="#202A40"/>
+  <text x="783" y="143" fill="#F4F7FB" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="15" font-weight="650">Data Engineer</text>
+  <rect x="1021" y="126" width="49" height="21" rx="10.5" fill="#B7F36B"/>
+  <text x="1031" y="141" fill="#172016" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="10" font-weight="800">SAVED</text>
+  <text x="765" y="188" fill="#C7D0DF" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="14">Application status history</text>
+  <text x="765" y="244" fill="#C7D0DF" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="14">Interview &amp; follow-up notes</text>
+  <rect x="765" y="272" width="319" height="34" rx="9" fill="#0B1020" stroke="#34415D"/>
+  <text x="779" y="294" fill="#B7F36B" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="12" font-weight="700">RESUME EVIDENCE</text>
+  <text x="935" y="294" fill="#AAB5CA" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="12">Python · SQL</text>
+</svg>
