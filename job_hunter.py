@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import email.utils
+import http.client
 import json
 import os
 import random
@@ -19,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 STATUSES = ("saved", "applied", "screening", "interview", "offer", "rejected", "withdrawn")
 STATUS_TRANSITIONS = {
@@ -83,6 +85,9 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
       due_at TEXT NOT NULL, note TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS follow_up_reminders(task_id INTEGER NOT NULL REFERENCES follow_up_tasks(id) ON DELETE CASCADE,
       reminder_date TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(task_id,reminder_date));
+    CREATE TABLE IF NOT EXISTS reminder_deliveries(task_id INTEGER NOT NULL REFERENCES follow_up_tasks(id) ON DELETE CASCADE,
+      reminder_date TEXT NOT NULL, claimed_at TEXT NOT NULL, delivered_at TEXT, status TEXT NOT NULL
+      CHECK(status IN ('claimed','sent','unknown')), PRIMARY KEY(task_id,reminder_date));
     CREATE TABLE IF NOT EXISTS hh_search_cache(cache_key TEXT PRIMARY KEY, expires_at REAL NOT NULL, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
       body TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -156,8 +161,10 @@ def set_status(db: sqlite3.Connection, vacancy_id: int, status: str) -> None:
     )
 
 
-def due_reminders(db: sqlite3.Connection, at: datetime | None = None, record: bool = False) -> list[dict[str, object]]:
-    """Return due follow-ups; optional daily recording makes repeated scheduler runs idempotent."""
+def due_reminders(
+    db: sqlite3.Connection, at: datetime | None = None, record: bool = False, include_recorded: bool = False
+) -> list[dict[str, object]]:
+    """Return due follow-ups; optionally record terminal-list reminders."""
     now_at = at or datetime.now(UTC)
     if now_at.utcoffset() is None:
         raise ValueError("Reminder time must include a timezone")
@@ -177,7 +184,7 @@ def due_reminders(db: sqlite3.Connection, at: datetime | None = None, record: bo
             continue
         reminder_date = local_now.date().isoformat()
         key = (row["id"], reminder_date)
-        if db.execute(
+        if not include_recorded and db.execute(
             "SELECT 1 FROM follow_up_reminders WHERE task_id=? AND reminder_date=?", key
         ).fetchone():
             continue
@@ -200,6 +207,178 @@ def complete_followup(db: sqlite3.Connection, task_id: int) -> None:
     changed = db.execute("UPDATE follow_up_tasks SET completed=1 WHERE id=? AND completed=0", (task_id,)).rowcount
     if not changed:
         raise ValueError("Pending follow-up not found")
+
+
+def _parse_clock_time(value: str) -> tuple[int, int] | None:
+    if not value:
+        return None
+    try:
+        hour_text, minute_text = value.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Quiet-hour times must use HH:MM") from exc
+    if len(hour_text) != 2 or len(minute_text) != 2 or not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("Quiet-hour times must use valid 24-hour HH:MM values")
+    return hour, minute
+
+
+def _quiet_bounds(quiet_start: str, quiet_end: str) -> tuple[int, int] | None:
+    start = _parse_clock_time(quiet_start)
+    end = _parse_clock_time(quiet_end)
+    if (start is None) != (end is None):
+        raise ValueError("Set both --quiet-start and --quiet-end, or leave both empty")
+    if start is None:
+        return None
+    start_minutes, end_minutes = start[0] * 60 + start[1], end[0] * 60 + end[1]
+    if start_minutes == end_minutes:
+        raise ValueError("Quiet-hour start and end must differ")
+    return start_minutes, end_minutes
+
+
+def _is_quiet(local_now: datetime, quiet_start: str, quiet_end: str) -> bool:
+    bounds = _quiet_bounds(quiet_start, quiet_end)
+    if bounds is None:
+        return False
+    start_minutes, end_minutes = bounds
+    current_minutes = local_now.hour * 60 + local_now.minute
+    if start_minutes < end_minutes:
+        return start_minutes <= current_minutes < end_minutes
+    return current_minutes >= start_minutes or current_minutes < end_minutes
+
+
+class ReminderAPI(Protocol):
+    def send(self, chat_id: int, text: str) -> None: ...
+
+
+class ReminderDeliveryError(RuntimeError):
+    """Telegram delivery failed or had an uncertain outcome and must not be retried."""
+
+
+class TelegramReminderAPI:
+    """One-shot Telegram delivery; ambiguous results are never retried."""
+
+    def __init__(self, token: str, timeout: float = 10) -> None:
+        if not token or ":" not in token:
+            raise ValueError("Set the configured Telegram bot token environment variable")
+        self._url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self._timeout = timeout
+
+    def send(self, chat_id: int, text: str) -> None:
+        request = urllib.request.Request(
+            self._url,
+            data=urllib.parse.urlencode({"chat_id": chat_id, "text": text[:3900]}).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                result = json.loads(response.read(100_000))
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            raise ReminderDeliveryError("Telegram send failed or has an unknown outcome; it will not be retried") from exc
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise ReminderDeliveryError("Telegram rejected the reminder; it will not be retried")
+
+
+def run_reminder_cycle(
+    db: sqlite3.Connection,
+    api: ReminderAPI,
+    chat_id: int,
+    timezone_name: str,
+    *,
+    quiet_start: str = "",
+    quiet_end: str = "",
+    at: datetime | None = None,
+) -> dict[str, int | bool]:
+    """Claim and attempt each due task once per local day; uncertain sends stay suppressed."""
+    if chat_id <= 0:
+        raise ValueError("Telegram chat ID must be a positive integer")
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("Unknown IANA timezone") from exc
+    now_at = at or datetime.now(UTC)
+    if now_at.utcoffset() is None:
+        raise ValueError("Scheduler time must include a timezone")
+    local_now = now_at.astimezone(zone)
+    if _is_quiet(local_now, quiet_start, quiet_end):
+        return {"quiet": True, "claimed": 0, "sent": 0, "unknown": 0}
+
+    # Terminal reminder logs must not suppress actual delivery through this separate scheduler ledger.
+    due = due_reminders(db, now_at, include_recorded=True)
+    reminder_date = local_now.date().isoformat()
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    claimed: list[dict[str, object]] = []
+    try:
+        for item in due:
+            cur = db.execute(
+                "INSERT OR IGNORE INTO reminder_deliveries(task_id,reminder_date,claimed_at,status) VALUES(?,?,?,'claimed')",
+                (item["id"], reminder_date, now_at.astimezone(UTC).isoformat(timespec="seconds")),
+            )
+            if cur.rowcount == 1:
+                claimed.append(item)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    sent = 0
+    unknown = 0
+    for item in claimed:
+        message = (
+            f"Job Hunter follow-up #{item['id']}\n{item['company']} / {item['title']}\n"
+            f"Due: {item['due_at']}\n{item['note']}"
+        )
+        try:
+            api.send(chat_id, message)
+        except (ReminderDeliveryError, OSError, TimeoutError):
+            db.execute(
+                "UPDATE reminder_deliveries SET status='unknown' WHERE task_id=? AND reminder_date=? AND status='claimed'",
+                (item["id"], reminder_date),
+            )
+            db.commit()
+            unknown += 1
+            print(f"Reminder #{item['id']} delivery outcome unknown; suppressed for {reminder_date}.", file=sys.stderr)
+        else:
+            db.execute(
+                "UPDATE reminder_deliveries SET status='sent',delivered_at=? WHERE task_id=? AND reminder_date=? AND status='claimed'",
+                (now_at.astimezone(UTC).isoformat(timespec="seconds"), item["id"], reminder_date),
+            )
+            db.commit()
+            sent += 1
+    return {"quiet": False, "claimed": len(claimed), "sent": sent, "unknown": unknown}
+
+
+def run_reminder_scheduler(
+    db_path: str | Path,
+    api: ReminderAPI,
+    chat_id: int,
+    timezone_name: str,
+    *,
+    quiet_start: str,
+    quiet_end: str,
+    poll_seconds: int = 60,
+    once: bool = False,
+    clock=None,
+    sleeper=None,
+    stop=None,
+) -> None:
+    if poll_seconds < 1:
+        raise ValueError("Poll interval must be at least one second")
+    clock = clock or (lambda: datetime.now(UTC))
+    sleeper = sleeper or time.sleep
+    stop = stop or (lambda: False)
+    while not stop():
+        db = connect(db_path)
+        try:
+            result = run_reminder_cycle(
+                db, api, chat_id, timezone_name, quiet_start=quiet_start, quiet_end=quiet_end, at=clock()
+            )
+            print(json.dumps(result, sort_keys=True))
+        finally:
+            db.close()
+        if once:
+            return
+        sleeper(poll_seconds)
 
 
 def add_interview_question(db: sqlite3.Connection, interview_id: int, question: str) -> None:
@@ -432,6 +611,15 @@ def main() -> int:
     sub.add_parser("followups")
     p = sub.add_parser("reminders", help="List due follow-ups; --record enables once-per-local-day deduplication")
     p.add_argument("--record", action="store_true")
+    p = sub.add_parser("reminder-scheduler", help="Optional background follow-up notifications; disabled by default")
+    p.add_argument("--enable-notifications", action="store_true", help="Explicitly enable Telegram delivery")
+    p.add_argument("--telegram-token-env", help="Environment variable name containing the bot token")
+    p.add_argument("--telegram-chat-id-env", help="Environment variable name containing the sole destination ID")
+    p.add_argument("--timezone", help="IANA timezone used for quiet hours and daily deduplication")
+    p.add_argument("--quiet-start", help="Quiet-hours start in HH:MM local time")
+    p.add_argument("--quiet-end", help="Quiet-hours end in HH:MM local time")
+    p.add_argument("--poll-seconds", type=int, default=60)
+    p.add_argument("--once", action="store_true", help="Run one scan instead of staying in the background")
     p = sub.add_parser("followup-complete")
     p.add_argument("id", type=int)
     sub.add_parser("interviews")
@@ -447,6 +635,37 @@ def main() -> int:
     p.add_argument("id", type=int)
     sub.add_parser("delete-all")
     args = parser.parse_args()
+    if args.cmd == "reminder-scheduler":
+        if not args.enable_notifications:
+            print("Notifications disabled. Pass --enable-notifications and explicit delivery settings to start.")
+            return 0
+        required = (
+            args.telegram_token_env, args.telegram_chat_id_env, args.timezone, args.quiet_start, args.quiet_end,
+        )
+        if not all(required):
+            print(
+                "Enabled notifications require token/chat environment variable names, timezone, and both quiet-hour times.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            token = os.environ.get(args.telegram_token_env, "")
+            chat_value = os.environ.get(args.telegram_chat_id_env, "")
+            if not chat_value.isdigit() or int(chat_value) <= 0:
+                raise ValueError("Configured Telegram chat ID must be a positive integer")
+            ZoneInfo(args.timezone)
+            _quiet_bounds(args.quiet_start, args.quiet_end)
+            api = TelegramReminderAPI(token)
+            run_reminder_scheduler(
+                args.db, api, int(chat_value), args.timezone, quiet_start=args.quiet_start,
+                quiet_end=args.quiet_end, poll_seconds=args.poll_seconds, once=args.once,
+            )
+        except (ValueError, TypeError, OSError, RuntimeError, sqlite3.Error, ZoneInfoNotFoundError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            print("Reminder scheduler stopped")
+        return 0
     db = connect(args.db)
     try:
         if args.cmd == "add":

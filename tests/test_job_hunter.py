@@ -23,6 +23,8 @@ from job_hunter import (
     due_reminders,
     list_vacancies,
     match_resume,
+    run_reminder_cycle,
+    run_reminder_scheduler,
     set_status,
 )
 
@@ -91,6 +93,115 @@ def test_due_reminder_rejects_naive_clock(tmp_path):
     db = connect(tmp_path / "jobs.db")
     with pytest.raises(ValueError, match="timezone"):
         due_reminders(db, datetime(2026, 1, 1))
+
+
+def _add_due_followup(db, due_at="2026-01-01T08:00:00+00:00"):
+    vacancy = add_vacancy(db, "Engineer", "Acme")
+    app_id = db.execute("select id from applications where vacancy_id=?", (vacancy,)).fetchone()[0]
+    return db.execute(
+        "insert into follow_up_tasks(application_id,due_at,note) values(?,?,?)",
+        (app_id, due_at, "Review the interview notes"),
+    ).lastrowid
+
+
+def test_reminder_scheduler_uses_fake_clock_timezone_and_persistent_local_day_dedupe(tmp_path):
+    class FakeClock:
+        at = datetime.fromisoformat("2026-01-01T23:30:00+00:00")
+
+        def __call__(self):
+            return self.at
+
+    class FakeAPI:
+        def __init__(self):
+            self.sends = []
+
+        def send(self, chat_id, text):
+            self.sends.append((chat_id, text))
+
+    path = tmp_path / "jobs.db"
+    db = connect(path)
+    task_id = _add_due_followup(db)
+    due_reminders(db, datetime.fromisoformat("2026-01-01T23:30:00+00:00"), record=True)
+    db.commit()
+    db.close()
+    clock = FakeClock()
+    api = FakeAPI()
+
+    run_reminder_scheduler(
+        path, api, 123, "America/Los_Angeles", quiet_start="22:00", quiet_end="08:00",
+        once=True, clock=clock, sleeper=lambda _: pytest.fail("one-shot scheduler must not sleep"),
+    )
+    assert len(api.sends) == 1 and api.sends[0][0] == 123
+    assert f"follow-up #{task_id}" in api.sends[0][1]
+    db = connect(path)
+    status = db.execute("select status,reminder_date from reminder_deliveries where task_id=?", (task_id,)).fetchone()
+    assert tuple(status) == ("sent", "2026-01-01")  # 23:30 UTC is 15:30 in Los Angeles.
+    db.close()
+
+    # Reopening the database and running again during the same configured local day cannot resend.
+    db = connect(path)
+    result = run_reminder_cycle(
+        db, api, 123, "America/Los_Angeles", quiet_start="22:00", quiet_end="08:00", at=clock(),
+    )
+    db.close()
+    assert result["claimed"] == 0 and len(api.sends) == 1
+
+
+def test_scheduler_quiet_hours_defer_and_unknown_send_is_never_retried(tmp_path):
+    class UncertainAPI:
+        def __init__(self):
+            self.attempts = 0
+
+        def send(self, chat_id, text):
+            self.attempts += 1
+            raise TimeoutError("synthetic ambiguous timeout")
+
+    path = tmp_path / "jobs.db"
+    db = connect(path)
+    task_id = _add_due_followup(db)
+    db.commit()
+    api = UncertainAPI()
+    quiet = run_reminder_cycle(
+        db, api, 123, "America/Los_Angeles", quiet_start="22:00", quiet_end="08:00",
+        at=datetime.fromisoformat("2026-01-02T07:30:00-08:00"),
+    )
+    assert quiet["quiet"] and api.attempts == 0
+    active = run_reminder_cycle(
+        db, api, 123, "America/Los_Angeles", quiet_start="22:00", quiet_end="08:00",
+        at=datetime.fromisoformat("2026-01-02T08:00:00-08:00"),
+    )
+    assert active["unknown"] == 1 and api.attempts == 1
+    repeated = run_reminder_cycle(
+        db, api, 123, "America/Los_Angeles", quiet_start="22:00", quiet_end="08:00",
+        at=datetime.fromisoformat("2026-01-02T08:01:00-08:00"),
+    )
+    assert repeated["claimed"] == 0 and api.attempts == 1
+    assert db.execute(
+        "select status from reminder_deliveries where task_id=? and reminder_date='2026-01-02'", (task_id,)
+    ).fetchone()[0] == "unknown"
+    db.close()
+
+
+def test_reminder_scheduler_is_disabled_by_default_in_cli(tmp_path):
+    db_path = tmp_path / "must-not-be-created.sqlite3"
+    result = subprocess.run(
+        [sys.executable, "job_hunter.py", "--db", str(db_path), "reminder-scheduler"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0
+    assert "Notifications disabled" in result.stdout
+    assert not db_path.exists()
+
+
+def test_enabled_scheduler_requires_explicit_delivery_settings(tmp_path):
+    db_path = tmp_path / "must-not-be-created.sqlite3"
+    result = subprocess.run(
+        [sys.executable, "job_hunter.py", "--db", str(db_path), "reminder-scheduler", "--enable-notifications"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 2
+    assert "require token/chat environment variable names" in result.stderr
+    assert not db_path.exists()
 
 
 def test_interview_preparation_questions_and_post_notes_are_attached_to_event(tmp_path):

@@ -11,6 +11,7 @@ printf 'Python, SQL in ETL projects.' > /tmp/resume-demo.txt
 python job_hunter.py --db /tmp/job-hunter-demo.sqlite3 match 1 /tmp/resume-demo.txt
 python job_hunter.py --db /tmp/job-hunter-demo.sqlite3 export
 python job_hunter.py --db /tmp/job-hunter-demo.sqlite3 backup /tmp/job-hunter-backup.sqlite3
+python job_hunter.py --db /tmp/job-hunter-demo.sqlite3 reminder-scheduler
 ```
 
-Expected behavior: vacancy starts in `saved`, the transition appears in the dashboard, matching returns resume snippets for Python and SQL and leaves Docker unmentioned, and CSV export includes the source and status. HH.ru search can be tried separately with `hh-search` and requires network access.
+Expected behavior: vacancy starts in `saved`, the transition appears in the dashboard, matching returns resume snippets for Python and SQL and leaves Docker unmentioned, CSV export includes the source and status, and the reminder scheduler reports that notifications are disabled without requiring credentials or making a network request. HH.ru search can be tried separately with `hh-search` and requires network access.
