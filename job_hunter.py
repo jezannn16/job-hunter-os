@@ -276,19 +276,28 @@ class HHSource:
             payload = self._request_json(req)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError, TypeError) as exc:
             raise RuntimeError("HH.ru search failed; check connectivity and retry later") from exc
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise TypeError("HH.ru returned an invalid vacancy list; retry later")
         fetched_at = now()
-        results = [
-            {
-                "title": x.get("name", ""),
-                "company": (x.get("employer") or {}).get("name", "Unknown employer"),
-                "url": x.get("alternate_url") or "",
-                "description": "",
-                "source": "hh.ru",
-                "published_at": x.get("published_at", ""),
-                "fetched_at": fetched_at,
-            }
-            for x in payload.get("items", [])
-        ]
+        results = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise TypeError("HH.ru returned an invalid vacancy record; retry later")
+            employer = item.get("employer") or {}
+            if not isinstance(employer, dict):
+                raise TypeError("HH.ru returned an invalid employer record; retry later")
+            results.append(
+                {
+                    "title": str(item.get("name") or ""),
+                    "company": str(employer.get("name") or "Unknown employer"),
+                    "url": str(item.get("alternate_url") or ""),
+                    "description": "",
+                    "source": "hh.ru",
+                    "published_at": str(item.get("published_at") or ""),
+                    "fetched_at": fetched_at,
+                }
+            )
         self._cache[key] = (time.monotonic() + self.cache_seconds, results)
         return [dict(row) for row in results]
 
@@ -577,7 +586,7 @@ def main() -> int:
             db.execute("DELETE FROM companies")
             print("All vacancy and application data deleted")
         db.commit()
-    except (ValueError, OSError, RuntimeError) as exc:
+    except (ValueError, TypeError, OSError, RuntimeError) as exc:
         db.rollback()
         print(f"Error: {exc}", file=sys.stderr)
         return 2

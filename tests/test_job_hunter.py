@@ -249,3 +249,19 @@ def test_hh_rate_limit_retry_after_then_success(monkeypatch):
     source = HHSource(timeout=4, backoff_seconds=0.1)
     assert source.search("python") == []
     assert calls == [4, 4] and sleeps == [2.0]
+
+
+def test_hh_malformed_payload_fails_with_actionable_service_error(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, size):
+            return b'{"items": [{"name":"Bad record", "employer":"unexpected"}]}'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    with pytest.raises(TypeError, match="invalid employer"):
+        HHSource().search("python")
