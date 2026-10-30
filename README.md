@@ -19,7 +19,7 @@
 | Vacancy search | Read-only public HH.ru search; saving results is an explicit option |
 | Storage | Local SQLite database; no account or API key required |
 
-The resume score is a small vocabulary-overlap heuristic, not a suitability judgment or offer probability. Skills absent from the resume are reported as unmentioned, not as proof of lacking them.
+The resume score is a small vocabulary-overlap heuristic, not a suitability judgment or offer probability. Skills absent from the resume are reported as unmentioned, not as proof of lacking them. Alias matching respects word boundaries, so `ML` does not match `HTML` and `SQL` does not match `NoSQL`; the supported skill vocabulary remains intentionally limited.
 
 ## Quick start
 

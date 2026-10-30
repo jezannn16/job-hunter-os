@@ -468,21 +468,28 @@ def list_vacancies(db: sqlite3.Connection, query: str = "", status: str = "") ->
 def match_resume(description: str, resume: str) -> dict[str, object]:
     """Only reports evidence found in the resume; absence means unknown, never a negative claim."""
     desc, cv = description.casefold(), resume.casefold()
+
+    def contains_alias(text: str, alias: str) -> bool:
+        # Treat aliases as words/phrases, so `ml` does not match `html` and
+        # `sql` does not match `nosql`. Unicode-aware \w also handles Russian.
+        pattern = rf"(?<!\w){re.escape(alias.casefold())}(?!\w)"
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
     required = re.findall(r"(?:required|обязательно|требуется)\s*:?\s*([^.;\n]+)", desc)
     desired = re.findall(r"(?:preferred|желательно)\s*:?\s*([^.;\n]+)", desc)
     terms = set()
     for chunk in required + desired:
         for term, aliases in SKILL_ALIASES.items():
-            if any(a in chunk.casefold() for a in aliases):
+            if any(contains_alias(chunk, alias) for alias in aliases):
                 terms.add(term)
     if not terms:
-        terms.update(term for term, aliases in SKILL_ALIASES.items() if any(a in desc for a in aliases))
+        terms.update(term for term, aliases in SKILL_ALIASES.items() if any(contains_alias(desc, alias) for alias in aliases))
     evidence = {}
     for term in sorted(terms):
-        hits = [a for a in SKILL_ALIASES[term] if a in cv]
+        hits = [alias for alias in SKILL_ALIASES[term] if contains_alias(cv, alias)]
         if hits:
             needle = hits[0]
-            pos = cv.find(needle)
+            pos = cv.find(needle.casefold())
             evidence[term] = (
                 resume[max(0, pos - 50) : min(len(resume), pos + len(needle) + 80)].replace("\n", " ").strip()
             )

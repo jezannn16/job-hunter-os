@@ -462,6 +462,14 @@ def test_empty_description_has_no_score():
     assert match_resume("", "Resume")["score"] is None
 
 
+def test_matcher_does_not_claim_substring_matches_as_skill_evidence():
+    result = match_resume("Required: ML and SQL.", "I build HTML dashboards and use NoSQL stores.")
+
+    assert result["matched"] == {}
+    assert result["unmentioned"] == ["machine learning", "sql"]
+    assert result["score"] == 0
+
+
 def test_hh_adapter_pagination_user_agent_timeout_and_cache():
     class Response:
         def __enter__(self):
