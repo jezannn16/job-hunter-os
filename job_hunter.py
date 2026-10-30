@@ -254,12 +254,21 @@ class ReminderDeliveryError(RuntimeError):
     """Telegram delivery failed or had an uncertain outcome and must not be retried."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The bot token is embedded in the API path; never follow a redirect with it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class TelegramReminderAPI:
     """One-shot Telegram delivery; ambiguous results are never retried."""
 
     def __init__(self, token: str, timeout: float = 10) -> None:
-        if not token or ":" not in token:
+        if not token or len(token) > 256 or not re.fullmatch(r"[0-9]{1,20}:[A-Za-z0-9_-]+", token):
             raise ValueError("Set the configured Telegram bot token environment variable")
+        if not 0 < timeout <= 30:
+            raise ValueError("Telegram timeout must be between 0 and 30 seconds")
         self._url = f"https://api.telegram.org/bot{token}/sendMessage"
         self._timeout = timeout
 
@@ -270,9 +279,10 @@ class TelegramReminderAPI:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            opener = urllib.request.build_opener(_NoRedirect)
+            with opener.open(request, timeout=self._timeout) as response:
                 result = json.loads(response.read(100_000))
-        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ReminderDeliveryError("Telegram send failed or has an unknown outcome; it will not be retried") from exc
         if not isinstance(result, dict) or not result.get("ok"):
             raise ReminderDeliveryError("Telegram rejected the reminder; it will not be retried")
@@ -303,12 +313,14 @@ def run_reminder_cycle(
         return {"quiet": True, "claimed": 0, "sent": 0, "unknown": 0}
 
     # Terminal reminder logs must not suppress actual delivery through this separate scheduler ledger.
-    due = due_reminders(db, now_at, include_recorded=True)
     reminder_date = local_now.date().isoformat()
     db.commit()
     db.execute("BEGIN IMMEDIATE")
     claimed: list[dict[str, object]] = []
     try:
+        # Select eligible tasks only after taking the write lock so a concurrent completion
+        # cannot leave a stale reminder in the pre-lock candidate list.
+        due = due_reminders(db, now_at, include_recorded=True)
         for item in due:
             cur = db.execute(
                 "INSERT OR IGNORE INTO reminder_deliveries(task_id,reminder_date,claimed_at,status) VALUES(?,?,?,'claimed')",

@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,8 @@ import pytest
 
 from job_hunter import (
     HHSource,
+    ReminderDeliveryError,
+    TelegramReminderAPI,
     add_interview_note,
     add_interview_question,
     add_vacancy,
@@ -180,6 +183,103 @@ def test_scheduler_quiet_hours_defer_and_unknown_send_is_never_retried(tmp_path)
         "select status from reminder_deliveries where task_id=? and reminder_date='2026-01-02'", (task_id,)
     ).fetchone()[0] == "unknown"
     db.close()
+
+
+def test_scheduler_reads_due_tasks_after_atomic_write_lock(tmp_path, monkeypatch):
+    import job_hunter
+    db = connect(tmp_path / "jobs.db")
+    _add_due_followup(db)
+    original = job_hunter.due_reminders
+    observed = []
+
+    def inspect_locked_read(*args, **kwargs):
+        observed.append(db.in_transaction)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(job_hunter, "due_reminders", inspect_locked_read)
+    result = run_reminder_cycle(
+        db, type("NoSend", (), {"send": lambda *_: None})(), 123, "UTC",
+        at=datetime.fromisoformat("2026-01-01T09:00:00+00:00"),
+    )
+    assert observed == [True]
+    assert result["claimed"] == 1
+    db.close()
+
+
+def test_legacy_database_migration_adds_scheduler_ledger_idempotently(tmp_path):
+    path = tmp_path / "legacy.db"
+    old = sqlite3.connect(path)
+    old.executescript("""
+      CREATE TABLE companies(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE);
+      CREATE TABLE vacancies(id INTEGER PRIMARY KEY,company_id INTEGER REFERENCES companies(id),title TEXT NOT NULL,
+        url TEXT,description TEXT NOT NULL DEFAULT '',source TEXT NOT NULL DEFAULT 'manual',fetched_at TEXT,created_at TEXT NOT NULL);
+      CREATE TABLE applications(id INTEGER PRIMARY KEY,vacancy_id INTEGER NOT NULL REFERENCES vacancies(id),status TEXT NOT NULL,updated_at TEXT NOT NULL);
+      CREATE TABLE follow_up_tasks(id INTEGER PRIMARY KEY,application_id INTEGER NOT NULL REFERENCES applications(id),
+        due_at TEXT NOT NULL,note TEXT NOT NULL,completed INTEGER NOT NULL DEFAULT 0);
+    """)
+    old.close()
+    db = connect(path)
+    assert "published_at" in {r[1] for r in db.execute("PRAGMA table_info(vacancies)")}
+    assert "reminder_deliveries" in {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    db.close()
+    db = connect(path)
+    assert db.execute("SELECT COUNT(*) FROM reminder_deliveries").fetchone()[0] == 0
+    db.close()
+
+
+def test_telegram_reminder_transport_blocks_redirect_and_marks_invalid_responses_uncertain(monkeypatch):
+    built = []
+
+    class ProbeOpener:
+        def __init__(self, handlers):
+            self.handlers = handlers
+
+        def open(self, request, timeout):
+            handlers = [h for h in self.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
+            assert len(handlers) == 1
+            assert handlers[0].redirect_request(
+                request, None, 302, "Found", {}, "https://attacker.example/collect"
+            ) is None
+            raise urllib.error.HTTPError(request.full_url, 302, "Found", {}, io.BytesIO())
+
+    def build_opener(*classes):
+        built.extend(classes)
+        return ProbeOpener([cls() for cls in classes])
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+    api = TelegramReminderAPI("123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    with pytest.raises(ReminderDeliveryError, match="unknown outcome"):
+        api.send(123, "synthetic reminder")
+    assert built and built[0].__name__ == "_NoRedirect"
+
+    class InvalidResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self, _):
+            return b"\xff"
+
+    monkeypatch.setattr(
+        urllib.request, "build_opener",
+        lambda *_: type("Opener", (), {"open": lambda *_args, **_kwargs: InvalidResponse()})(),
+    )
+    with pytest.raises(ReminderDeliveryError, match="unknown outcome"):
+        api.send(123, "synthetic reminder")
+
+
+@pytest.mark.parametrize("token", ["bad:token", "123456789:bad/token-with-slash", "123456789:with space"])
+def test_telegram_reminder_rejects_malformed_tokens(token):
+    with pytest.raises(ValueError, match="token environment variable"):
+        TelegramReminderAPI(token)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 31])
+def test_telegram_reminder_requires_bounded_timeout(timeout):
+    with pytest.raises(ValueError, match="timeout"):
+        TelegramReminderAPI("123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi", timeout=timeout)
 
 
 def test_reminder_scheduler_is_disabled_by_default_in_cli(tmp_path):
