@@ -1,11 +1,20 @@
+import csv
 import json
+import os
+import sqlite3
+import stat
+import subprocess
+import sys
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from job_hunter import (
     HHSource,
+    add_interview_note,
+    add_interview_question,
     add_vacancy,
     complete_followup,
     connect,
@@ -70,6 +79,98 @@ def test_due_reminder_rejects_naive_clock(tmp_path):
     db = connect(tmp_path / "jobs.db")
     with pytest.raises(ValueError, match="timezone"):
         due_reminders(db, datetime(2026, 1, 1))
+
+
+def test_interview_preparation_questions_and_post_notes_are_attached_to_event(tmp_path):
+    db = connect(tmp_path / "jobs.db")
+    vacancy = add_vacancy(db, "Engineer", "Acme")
+    app_id = db.execute("select id from applications where vacancy_id=?", (vacancy,)).fetchone()[0]
+    interview_id = db.execute(
+        "insert into interview_events(application_id,starts_at,notes) values(?,?,?)",
+        (app_id, "2026-11-01T09:00:00+03:00", "Screen call"),
+    ).lastrowid
+
+    add_interview_question(db, interview_id, "How do retries handle duplicate work?")
+    add_interview_note(db, interview_id, "Discussed Python and SQL examples.")
+
+    assert db.execute("select question from interview_questions where interview_id=?", (interview_id,)).fetchone()[0].startswith("How do")
+    assert db.execute("select body from interview_post_notes where interview_id=?", (interview_id,)).fetchone()[0].startswith("Discussed")
+    with pytest.raises(ValueError, match="Interview not found"):
+        add_interview_note(db, 404, "Orphan note")
+
+
+def test_old_job_database_opens_with_additive_reminder_schema(tmp_path):
+    path = tmp_path / "older.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        """CREATE TABLE companies(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE);
+        CREATE TABLE vacancies(id INTEGER PRIMARY KEY,company_id INTEGER,title TEXT,url TEXT,description TEXT,source TEXT,fetched_at TEXT,created_at TEXT);
+        CREATE TABLE applications(id INTEGER PRIMARY KEY,vacancy_id INTEGER,status TEXT,updated_at TEXT);
+        CREATE TABLE follow_up_tasks(id INTEGER PRIMARY KEY,application_id INTEGER,due_at TEXT,note TEXT,completed INTEGER DEFAULT 0);
+        INSERT INTO companies VALUES(1,'Legacy Co');
+        INSERT INTO vacancies VALUES(1,1,'Role','','','manual',NULL,'2026-01-01T00:00:00+00:00');
+        INSERT INTO applications VALUES(1,1,'applied','2026-01-01T00:00:00+00:00');
+        INSERT INTO follow_up_tasks VALUES(1,1,'2026-01-02T09:00:00+00:00','Legacy reminder',0);"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    db = connect(path)
+    reminders = due_reminders(db, datetime.fromisoformat("2026-01-02T10:00:00+00:00"), record=True)
+    assert reminders[0]["note"] == "Legacy reminder"
+    assert db.execute("select count(*) from follow_up_reminders").fetchone()[0] == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file mode check")
+def test_database_file_permissions_are_owner_only(tmp_path):
+    path = tmp_path / "private-jobs.sqlite3"
+    db = connect(path)
+    db.close()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_interview_cli_sorts_by_instant_across_timezone_offsets(tmp_path):
+    project = Path(__file__).resolve().parents[1]
+    database = tmp_path / "jobs.sqlite3"
+
+    def cli(*args):
+        return subprocess.run(
+            [sys.executable, "job_hunter.py", "--db", str(database), *args],
+            cwd=project,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    cli("add", "Engineer", "Synthetic Co")
+    cli("interview-add", "1", "2026-11-01T10:00:00-05:00", "--notes", "Later UTC")
+    cli("interview-add", "1", "2026-11-01T14:00:00+03:00", "--notes", "Earlier UTC")
+    agenda = cli("interviews")
+
+    assert agenda.index("#2") < agenda.index("#1")
+
+
+def test_csv_export_neutralizes_formula_like_untrusted_text(tmp_path):
+    project = Path(__file__).resolve().parents[1]
+    database = tmp_path / "jobs.sqlite3"
+    output = subprocess.run(
+        [sys.executable, "job_hunter.py", "--db", str(database), "add", "=HYPERLINK(\"https://example.invalid\")", "@SUM(1,1)"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Saved vacancy" in output.stdout
+    exported = subprocess.run(
+        [sys.executable, "job_hunter.py", "--db", str(database), "export"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    row = next(csv.DictReader(exported.stdout.splitlines()))
+    assert row["title"].startswith("'=HYPERLINK")
+    assert row["company"].startswith("'@SUM")
 
 
 def test_match_is_evidence_based_and_bilingual():

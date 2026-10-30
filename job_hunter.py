@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -44,8 +45,21 @@ def now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def spreadsheet_safe_text(value: object) -> object:
+    """Neutralize spreadsheet formulas in untrusted text written to CSV."""
+    if isinstance(value, str) and value.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     db = sqlite3.connect(db_path)
+    if os.name == "posix" and str(db_path) != ":memory:":
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            db.close()
+            raise RuntimeError("Could not restrict the database file to the current user") from None
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     db.executescript("""
@@ -59,6 +73,10 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS resume_versions(id INTEGER PRIMARY KEY, name TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS interview_events(id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
       starts_at TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '');
+    CREATE TABLE IF NOT EXISTS interview_questions(id INTEGER PRIMARY KEY, interview_id INTEGER NOT NULL REFERENCES interview_events(id) ON DELETE CASCADE,
+      question TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS interview_post_notes(id INTEGER PRIMARY KEY, interview_id INTEGER NOT NULL REFERENCES interview_events(id) ON DELETE CASCADE,
+      body TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS follow_up_tasks(id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
       due_at TEXT NOT NULL, note TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS follow_up_reminders(task_id INTEGER NOT NULL REFERENCES follow_up_tasks(id) ON DELETE CASCADE,
@@ -128,7 +146,7 @@ def due_reminders(db: sqlite3.Connection, at: datetime | None = None, record: bo
     for row in rows:
         due_at = datetime.fromisoformat(row["due_at"])
         if due_at.utcoffset() is None:
-            continue
+            raise ValueError(f"Follow-up #{row['id']} has no timezone; update it with an ISO datetime offset")
         local_now = now_at.astimezone(due_at.tzinfo)
         if due_at > local_now:
             continue
@@ -149,6 +167,7 @@ def due_reminders(db: sqlite3.Connection, at: datetime | None = None, record: bo
                 "INSERT OR IGNORE INTO follow_up_reminders(task_id,reminder_date,recorded_at) VALUES(?,?,?)",
                 (row["id"], reminder_date, now_at.astimezone(UTC).isoformat(timespec="seconds")),
             )
+    reminders.sort(key=lambda row: datetime.fromisoformat(str(row["due_at"])).astimezone(UTC))
     return reminders
 
 
@@ -156,6 +175,24 @@ def complete_followup(db: sqlite3.Connection, task_id: int) -> None:
     changed = db.execute("UPDATE follow_up_tasks SET completed=1 WHERE id=? AND completed=0", (task_id,)).rowcount
     if not changed:
         raise ValueError("Pending follow-up not found")
+
+
+def add_interview_question(db: sqlite3.Connection, interview_id: int, question: str) -> None:
+    question = question.strip()
+    if not question:
+        raise ValueError("Interview question is required")
+    if db.execute("SELECT 1 FROM interview_events WHERE id=?", (interview_id,)).fetchone() is None:
+        raise ValueError("Interview not found")
+    db.execute("INSERT INTO interview_questions(interview_id,question,created_at) VALUES(?,?,?)", (interview_id, question, now()))
+
+
+def add_interview_note(db: sqlite3.Connection, interview_id: int, body: str) -> None:
+    body = body.strip()
+    if not body:
+        raise ValueError("Interview note is required")
+    if db.execute("SELECT 1 FROM interview_events WHERE id=?", (interview_id,)).fetchone() is None:
+        raise ValueError("Interview not found")
+    db.execute("INSERT INTO interview_post_notes(interview_id,body,created_at) VALUES(?,?,?)", (interview_id, body, now()))
 
 
 def list_vacancies(db: sqlite3.Connection, query: str = "", status: str = "") -> list[sqlite3.Row]:
@@ -283,6 +320,14 @@ def main() -> int:
     p.add_argument("vacancy_id", type=int)
     p.add_argument("starts_at")
     p.add_argument("--notes", default="")
+    p = sub.add_parser("interview-question-add")
+    p.add_argument("interview_id", type=int)
+    p.add_argument("question")
+    p = sub.add_parser("interview-note-add")
+    p.add_argument("interview_id", type=int)
+    p.add_argument("body")
+    sub.add_parser("interview-questions")
+    sub.add_parser("interview-notes")
     p = sub.add_parser("followup-add")
     p.add_argument("vacancy_id", type=int)
     p.add_argument("due_at")
@@ -356,6 +401,8 @@ def main() -> int:
                 db.backup(destination)
             finally:
                 destination.close()
+            if os.name == "posix":
+                os.chmod(args.file, 0o600)
             print(f"Database backup written to {args.file}")
         elif args.cmd in ("interview-add", "followup-add", "note-add"):
             exists = db.execute("SELECT id FROM applications WHERE vacancy_id=?", (args.vacancy_id,)).fetchone()
@@ -382,10 +429,17 @@ def main() -> int:
                     "INSERT INTO notes(application_id,body,created_at) VALUES(?,?,?)", (exists[0], args.body, now())
                 )
                 print("Note saved")
+        elif args.cmd == "interview-question-add":
+            add_interview_question(db, args.interview_id, args.question)
+            print("Interview question saved")
+        elif args.cmd == "interview-note-add":
+            add_interview_note(db, args.interview_id, args.body)
+            print("Interview note saved")
         elif args.cmd == "followups":
             rows = db.execute(
                 "SELECT f.due_at,f.note,v.title,c.name company FROM follow_up_tasks f JOIN applications a ON a.id=f.application_id JOIN vacancies v ON v.id=a.vacancy_id JOIN companies c ON c.id=v.company_id WHERE f.completed=0 ORDER BY f.due_at"
             ).fetchall()
+            rows = sorted(rows, key=lambda row: datetime.fromisoformat(row["due_at"]).astimezone(UTC))
             for row in rows:
                 state = (
                     "OVERDUE"
@@ -408,12 +462,29 @@ def main() -> int:
             print("Follow-up completed")
         elif args.cmd == "interviews":
             rows = db.execute(
-                "SELECT i.starts_at,i.notes,v.title,c.name company FROM interview_events i JOIN applications a ON a.id=i.application_id JOIN vacancies v ON v.id=a.vacancy_id JOIN companies c ON c.id=v.company_id ORDER BY i.starts_at"
+                "SELECT i.id,i.starts_at,i.notes,v.title,c.name company FROM interview_events i JOIN applications a ON a.id=i.application_id JOIN vacancies v ON v.id=a.vacancy_id JOIN companies c ON c.id=v.company_id"
             ).fetchall()
+            rows = sorted(rows, key=lambda row: datetime.fromisoformat(row["starts_at"]).astimezone(UTC))
             for row in rows:
-                print(f"{row['starts_at']} — {row['company']} / {row['title']}: {row['notes']}")
+                print(f"#{row['id']} {row['starts_at']} — {row['company']} / {row['title']}: {row['notes']}")
             if not rows:
                 print("No interviews")
+        elif args.cmd == "interview-questions":
+            rows = db.execute(
+                "SELECT q.interview_id,q.question,i.starts_at,v.title,c.name company FROM interview_questions q JOIN interview_events i ON i.id=q.interview_id JOIN applications a ON a.id=i.application_id JOIN vacancies v ON v.id=a.vacancy_id JOIN companies c ON c.id=v.company_id ORDER BY q.interview_id,q.id"
+            ).fetchall()
+            for row in rows:
+                print(f"#{row['interview_id']} {row['starts_at']} — {row['company']} / {row['title']}: {row['question']}")
+            if not rows:
+                print("No interview preparation questions")
+        elif args.cmd == "interview-notes":
+            rows = db.execute(
+                "SELECT n.interview_id,n.body,i.starts_at,v.title,c.name company FROM interview_post_notes n JOIN interview_events i ON i.id=n.interview_id JOIN applications a ON a.id=i.application_id JOIN vacancies v ON v.id=a.vacancy_id JOIN companies c ON c.id=v.company_id ORDER BY n.interview_id,n.id"
+            ).fetchall()
+            for row in rows:
+                print(f"#{row['interview_id']} {row['starts_at']} — {row['company']} / {row['title']}: {row['body']}")
+            if not rows:
+                print("No post-interview notes")
         elif args.cmd == "dashboard":
             for status in STATUSES:
                 items = list_vacancies(db, status=status)
@@ -424,7 +495,9 @@ def main() -> int:
             writer = csv.writer(sys.stdout)
             writer.writerow(["id", "title", "company", "status", "url", "source", "description"])
             for x in list_vacancies(db):
-                writer.writerow([x[k] for k in ("id", "title", "company", "status", "url", "source", "description")])
+                writer.writerow(
+                    [x["id"]] + [spreadsheet_safe_text(x[k]) for k in ("title", "company", "status", "url", "source", "description")]
+                )
         elif args.cmd == "export-md":
             for status in STATUSES:
                 items = list_vacancies(db, status=status)

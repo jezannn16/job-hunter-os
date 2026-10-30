@@ -42,6 +42,8 @@ printf 'Python and SQL experience in ETL projects.\n' > /tmp/resume-demo.txt
 python job_hunter.py --db /tmp/jobs-demo.sqlite3 match 1 /tmp/resume-demo.txt
 python job_hunter.py --db /tmp/jobs-demo.sqlite3 export-md
 python job_hunter.py --db /tmp/jobs-demo.sqlite3 reminders
+python job_hunter.py --db /tmp/jobs-demo.sqlite3 interview-question-add 1 'How do you handle retries?'
+python job_hunter.py --db /tmp/jobs-demo.sqlite3 interview-questions
 ```
 
 The match output includes evidence snippets for Python and SQL and lists Docker as unmentioned. Data remains in the local database; resume files are read locally.
@@ -73,8 +75,8 @@ Network availability and HH.ru policy can affect that optional check. It does no
 
 ## Data and scope
 
-Vacancy descriptions and saved resume versions are stored as plain text in SQLite. Keep sensitive information out of shared or unencrypted databases. The database is single-user and local; it is not encrypted.
+Vacancy descriptions and saved resume versions are stored as plain text in SQLite. On POSIX systems the database and SQLite backup are restricted to the current user (mode 0600). The database is still unencrypted; use a private directory and avoid sensitive information on shared or unencrypted storage.
 
-There is no auto-apply, website scraping, outbound messaging, or external calendar integration. `reminders` prints follow-ups due in their saved timezone; `reminders --record` records a single reminder per task and local calendar day, so a local scheduler can invoke it repeatedly without duplicate reminders. `followup-complete ID` closes a task. The command does not send notifications outside the terminal. Matching supports a deliberately small Russian/English skill vocabulary.
+There is no auto-apply, website scraping, outbound messaging, or external calendar integration. Interview events accept ISO datetimes with offsets and list chronologically across timezones. Add and review preparation questions with `interview-question-add EVENT_ID QUESTION` and `interview-questions`; save post-interview notes with `interview-note-add EVENT_ID TEXT` and review them with `interview-notes`. `reminders` prints follow-ups due in their saved timezone; `reminders --record` records a single reminder per task and local calendar day, so a local scheduler can invoke it repeatedly without duplicate reminders. `followup-complete ID` closes a task. The command does not send notifications outside the terminal. CSV export prefixes spreadsheet formula-like text with an apostrophe to prevent formula execution when opened in spreadsheet software. Matching supports a deliberately small Russian/English skill vocabulary.
 
 See [demo steps](docs/demo.md) for the synthetic walkthrough.
