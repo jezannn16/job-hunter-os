@@ -262,7 +262,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class TelegramReminderAPI:
-    """One-shot Telegram delivery; ambiguous results are never retried."""
+    """Deliver reminders once, allowing one bounded retry only after an explicit HTTP 429."""
+
+    max_rate_limit_retries = 1
 
     def __init__(self, token: str, timeout: float = 10) -> None:
         if not token or len(token) > 256 or not re.fullmatch(r"[0-9]{1,20}:[A-Za-z0-9_-]+", token):
@@ -272,20 +274,57 @@ class TelegramReminderAPI:
         self._url = f"https://api.telegram.org/bot{token}/sendMessage"
         self._timeout = timeout
 
+    @staticmethod
+    def _retry_after(exc: urllib.error.HTTPError) -> float:
+        """Read Telegram's explicit rate-limit delay and cap it to a short safe wait."""
+        retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        if retry_after:
+            try:
+                return min(30.0, max(0.0, float(retry_after)))
+            except ValueError:
+                pass
+        try:
+            payload = json.loads(exc.read(100_000))
+            value = payload.get("parameters", {}).get("retry_after") if isinstance(payload, dict) else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return min(30.0, max(0.0, float(value)))
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, TypeError):
+            pass
+        return 1.0
+
     def send(self, chat_id: int, text: str) -> None:
         request = urllib.request.Request(
             self._url,
             data=urllib.parse.urlencode({"chat_id": chat_id, "text": text[:3900]}).encode(),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        try:
-            opener = urllib.request.build_opener(_NoRedirect)
-            with opener.open(request, timeout=self._timeout) as response:
-                result = json.loads(response.read(100_000))
-        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ReminderDeliveryError("Telegram send failed or has an unknown outcome; it will not be retried") from exc
-        if not isinstance(result, dict) or not result.get("ok"):
-            raise ReminderDeliveryError("Telegram rejected the reminder; it will not be retried")
+        for attempt in range(self.max_rate_limit_retries + 1):
+            try:
+                opener = urllib.request.build_opener(_NoRedirect)
+                with opener.open(request, timeout=self._timeout) as response:
+                    result = json.loads(response.read(100_000))
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < self.max_rate_limit_retries:
+                    delay = self._retry_after(exc)
+                    exc.close()
+                    time.sleep(delay)
+                    continue
+                exc.close()
+                if exc.code < 400 or exc.code >= 500:
+                    raise ReminderDeliveryError(
+                        "Telegram send failed or has an unknown outcome; it will not be retried"
+                    ) from None
+                raise ReminderDeliveryError(
+                    "Telegram rejected the reminder; it will not be retried"
+                ) from None
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException,
+                    json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ReminderDeliveryError(
+                    "Telegram send failed or has an unknown outcome; it will not be retried"
+                ) from exc
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise ReminderDeliveryError("Telegram rejected the reminder; it will not be retried")
+            return
 
 
 def run_reminder_cycle(

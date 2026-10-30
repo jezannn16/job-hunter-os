@@ -247,7 +247,7 @@ def test_telegram_reminder_transport_blocks_redirect_and_marks_invalid_responses
         return ProbeOpener([cls() for cls in classes])
 
     monkeypatch.setattr(urllib.request, "build_opener", build_opener)
-    api = TelegramReminderAPI("123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    api = TelegramReminderAPI("123456789:synthetic-token")
     with pytest.raises(ReminderDeliveryError, match="unknown outcome"):
         api.send(123, "synthetic reminder")
     assert built and built[0].__name__ == "_NoRedirect"
@@ -270,6 +270,60 @@ def test_telegram_reminder_transport_blocks_redirect_and_marks_invalid_responses
         api.send(123, "synthetic reminder")
 
 
+def test_telegram_reminder_retries_one_explicit_429_using_retry_after(monkeypatch):
+    attempts = []
+    waits = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self, _):
+            return b'{"ok":true,"result":{"message_id":1}}'
+
+    class Opener:
+        def __init__(self, response):
+            self.response = response
+
+        def open(self, request, timeout):
+            attempts.append((request, timeout))
+            if isinstance(self.response, Exception):
+                raise self.response
+            return self.response
+
+    queue = [
+        urllib.error.HTTPError(
+            "https://api.telegram.org/botfake/sendMessage", 429, "Too Many Requests",
+            {"Retry-After": "2"}, io.BytesIO(b'{"parameters":{"retry_after":3}}'),
+        ),
+        Response(),
+    ]
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener(queue.pop(0)))
+    monkeypatch.setattr("job_hunter.time.sleep", waits.append)
+    TelegramReminderAPI("123456789:synthetic-token").send(123, "synthetic reminder")
+    assert len(attempts) == 2
+    assert waits == [2.0]
+
+
+def test_telegram_reminder_does_not_retry_server_error(monkeypatch):
+    attempts = []
+
+    class Opener:
+        def open(self, request, timeout):
+            attempts.append(request)
+            raise urllib.error.HTTPError(
+                request.full_url, 503, "Unavailable", {}, io.BytesIO(b"temporary failure")
+            )
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    with pytest.raises(ReminderDeliveryError, match="unknown outcome"):
+        TelegramReminderAPI("123456789:synthetic-token").send(123, "synthetic reminder")
+    assert len(attempts) == 1
+
+
 @pytest.mark.parametrize("token", ["bad:token", "123456789:bad/token-with-slash", "123456789:with space"])
 def test_telegram_reminder_rejects_malformed_tokens(token):
     with pytest.raises(ValueError, match="token environment variable"):
@@ -279,7 +333,7 @@ def test_telegram_reminder_rejects_malformed_tokens(token):
 @pytest.mark.parametrize("timeout", [0, -1, 31])
 def test_telegram_reminder_requires_bounded_timeout(timeout):
     with pytest.raises(ValueError, match="timeout"):
-        TelegramReminderAPI("123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi", timeout=timeout)
+        TelegramReminderAPI("123456789:synthetic-token", timeout=timeout)
 
 
 def test_reminder_scheduler_is_disabled_by_default_in_cli(tmp_path):
