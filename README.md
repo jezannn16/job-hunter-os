@@ -56,7 +56,7 @@ Public vacancy search is a read-only anonymous request and needs no credentials.
 python job_hunter.py --db /tmp/jobs-demo.sqlite3 hh-search 'аналитик данных' --page 0
 ```
 
-Add `--save` only when you want the returned vacancies stored in the selected database. The search uses one page per request and an identifying User-Agent. See the [HH.ru vacancy API](https://github.com/hhru/api/blob/master/docs/vacancies.md).
+Add `--save` only when you want the returned vacancies stored in the selected database. The search uses one page per request, an identifying User-Agent, bounded retries for 429/5xx and transient network errors, and honors `Retry-After` up to 30 seconds. Results expose HH publication time and local fetch time; saved vacancies retain publication time. See the [HH.ru vacancy API](https://github.com/hhru/api/blob/master/docs/vacancies.md).
 
 ## Tests and CI
 

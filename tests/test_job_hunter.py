@@ -1,10 +1,12 @@
 import csv
+import io
 import json
 import os
 import sqlite3
 import stat
 import subprocess
 import sys
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -198,7 +200,10 @@ def test_hh_adapter_pagination_user_agent_timeout_and_cache():
             return json.dumps(
                 {
                     "items": [
-                        {"name": "Инженер", "employer": {"name": "Company"}, "alternate_url": "https://hh.ru/vacancy/1"}
+                        {
+                            "name": "Инженер", "employer": {"name": "Company"},
+                            "alternate_url": "https://hh.ru/vacancy/1", "published_at": "2026-10-29T10:00:00+0300",
+                        }
                     ]
                 }
             ).encode()
@@ -211,8 +216,36 @@ def test_hh_adapter_pagination_user_agent_timeout_and_cache():
 
     source = HHSource(timeout=3)
     with patch("urllib.request.urlopen", fake):
-        assert source.search("python", page=2)[0]["source"] == "hh.ru"
+        result = source.search("python", page=2)[0]
+        assert result["source"] == "hh.ru" and result["published_at"] == "2026-10-29T10:00:00+0300"
+        assert result["fetched_at"].endswith("+00:00")
         source.search("python", page=2)
     assert (
         len(seen) == 1 and "page=2" in seen[0][0] and seen[0][1].startswith("PersonalAutomationLab") and seen[0][2] == 3
     )
+
+
+def test_hh_rate_limit_retry_after_then_success(monkeypatch):
+    calls, sleeps = [], []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, size):
+            return b'{"items": []}'
+
+    def fake(req, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {"Retry-After": "2"}, io.BytesIO())
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    source = HHSource(timeout=4, backoff_seconds=0.1)
+    assert source.search("python") == []
+    assert calls == [4, 4] and sleeps == [2.0]

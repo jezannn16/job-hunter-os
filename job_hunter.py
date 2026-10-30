@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import email.utils
 import json
 import os
+import random
 import re
 import sqlite3
 import sys
@@ -85,11 +87,15 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
       body TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_vacancy_title ON vacancies(title);
     """)
+    columns = {row[1] for row in db.execute("PRAGMA table_info(vacancies)")}
+    if "published_at" not in columns:
+        db.execute("ALTER TABLE vacancies ADD COLUMN published_at TEXT")
     return db
 
 
 def add_vacancy(
-    db: sqlite3.Connection, title: str, company: str, url: str = "", description: str = "", source: str = "manual"
+    db: sqlite3.Connection, title: str, company: str, url: str = "", description: str = "", source: str = "manual",
+    published_at: str = "",
 ) -> int:
     title, company = title.strip(), company.strip()
     if not title or not company:
@@ -99,8 +105,8 @@ def add_vacancy(
     )
     company_id = db.execute("SELECT id FROM companies WHERE name=?", (company,)).fetchone()[0]
     cur = db.execute(
-        "INSERT INTO vacancies(company_id,title,url,description,source,fetched_at,created_at) VALUES(?,?,?,?,?,?,?)",
-        (company_id, title, url.strip(), description.strip(), source, now() if source != "manual" else None, now()),
+        "INSERT INTO vacancies(company_id,title,url,description,source,fetched_at,created_at,published_at) VALUES(?,?,?,?,?,?,?,?)",
+        (company_id, title, url.strip(), description.strip(), source, now() if source != "manual" else None, now(), published_at or None),
     )
     vacancy_id = cur.lastrowid
     cur = db.execute(
@@ -196,7 +202,7 @@ def add_interview_note(db: sqlite3.Connection, interview_id: int, body: str) -> 
 
 
 def list_vacancies(db: sqlite3.Connection, query: str = "", status: str = "") -> list[sqlite3.Row]:
-    sql = """SELECT v.id,v.title,c.name company,v.url,v.source,v.fetched_at,a.status,v.created_at,v.description
+    sql = """SELECT v.id,v.title,c.name company,v.url,v.source,v.fetched_at,v.published_at,a.status,v.created_at,v.description
              FROM vacancies v JOIN companies c ON c.id=v.company_id JOIN applications a ON a.vacancy_id=v.id"""
     clauses, params = [], []
     if query:
@@ -250,6 +256,8 @@ class HHSource:
     user_agent: str = "PersonalAutomationLab/0.1 (local personal tool)"
     timeout: float = 8.0
     cache_seconds: float = 300.0
+    max_attempts: int = 3
+    backoff_seconds: float = 0.25
     _cache: dict[tuple[str, int], tuple[float, list[dict[str, str]]]] = field(default_factory=dict, repr=False)
 
     def search(self, text: str, page: int = 0) -> list[dict[str, str]]:
@@ -265,10 +273,10 @@ class HHSource:
             headers={"User-Agent": self.user_agent, "Accept": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                payload = json.loads(response.read(2_000_001))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            payload = self._request_json(req)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError, TypeError) as exc:
             raise RuntimeError("HH.ru search failed; check connectivity and retry later") from exc
+        fetched_at = now()
         results = [
             {
                 "title": x.get("name", ""),
@@ -276,11 +284,49 @@ class HHSource:
                 "url": x.get("alternate_url") or "",
                 "description": "",
                 "source": "hh.ru",
+                "published_at": x.get("published_at", ""),
+                "fetched_at": fetched_at,
             }
             for x in payload.get("items", [])
         ]
         self._cache[key] = (time.monotonic() + self.cache_seconds, results)
         return [dict(row) for row in results]
+
+    def _request_json(self, req: urllib.request.Request) -> dict[str, object]:
+        attempts = max(1, self.max_attempts)
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                    payload = json.loads(response.read(2_000_001))
+                if not isinstance(payload, dict):
+                    raise TypeError("HH.ru returned an invalid response")
+                return payload
+            except urllib.error.HTTPError as exc:
+                retryable = exc.code == 429 or 500 <= exc.code <= 599
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                exc.close()
+                if not retryable or attempt + 1 >= attempts:
+                    raise
+                delay = self._retry_delay(attempt, retry_after)
+            except (urllib.error.URLError, TimeoutError, OSError):
+                if attempt + 1 >= attempts:
+                    raise
+                delay = self._retry_delay(attempt, None)
+            time.sleep(delay)
+        raise RuntimeError("HH.ru request attempts exhausted")
+
+    def _retry_delay(self, attempt: int, retry_after: str | None) -> float:
+        if retry_after:
+            try:
+                return min(30.0, max(0.0, float(retry_after)))
+            except ValueError:
+                try:
+                    target = email.utils.parsedate_to_datetime(retry_after)
+                    return min(30.0, max(0.0, (target - datetime.now(target.tzinfo or UTC)).total_seconds()))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        base = max(0.0, self.backoff_seconds) * (2**attempt)
+        return min(30.0, base * random.uniform(0.8, 1.2))
 
 
 def main() -> int:
@@ -356,7 +402,10 @@ def main() -> int:
             print(f"Saved vacancy #{add_vacancy(db, args.title, args.company, args.url, args.description)}")
         elif args.cmd == "list":
             for x in list_vacancies(db, args.search, args.status):
-                print(f"#{x['id']} [{x['status']}] {x['title']} — {x['company']} | {x['url']} [{x['source']}]")
+                print(
+                    f"#{x['id']} [{x['status']}] {x['title']} — {x['company']} | {x['url']} "
+                    f"[{x['source']}; published {x['published_at'] or 'unknown'}; fetched {x['fetched_at'] or 'n/a'}]"
+                )
         elif args.cmd == "status":
             set_status(db, args.id, args.value)
             print("Status updated")
@@ -377,9 +426,14 @@ def main() -> int:
         elif args.cmd == "hh-search":
             results = HHSource().search(args.query, args.page)
             for i, x in enumerate(results, 1):
-                print(f"{i}. {x['title']} — {x['company']} | {x['url']}")
+                print(
+                    f"{i}. {x['title']} — {x['company']} | {x['url']} "
+                    f"[published {x['published_at'] or 'unknown'}; fetched {x['fetched_at']}]"
+                )
                 if args.save:
-                    add_vacancy(db, x["title"], x["company"], x["url"], x["description"], x["source"])
+                        add_vacancy(
+                            db, x["title"], x["company"], x["url"], x["description"], x["source"], x["published_at"]
+                        )
         elif args.cmd == "resume-add":
             content = Path(args.file).read_text(encoding="utf-8")
             if not content.strip():
