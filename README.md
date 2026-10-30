@@ -12,7 +12,7 @@
 
 | Area | Available now |
 | --- | --- |
-| Applications | Add manually or import vacancy text; filter and export CSV or Markdown |
+| Applications | Add manually or import vacancy text; repeated URL or no-URL company/title entries reuse the existing record; filter and export CSV or Markdown |
 | History | Track constrained status changes, notes, interview dates, and follow-up tasks |
 | Reminders | List due follow-ups; `reminders --record` is safe to run repeatedly and records one local-day reminder per task |
 | Resume evidence | Compare a vacancy with a local resume file and show matching snippets |
@@ -46,7 +46,7 @@ python job_hunter.py --db /tmp/jobs-demo.sqlite3 interview-question-add 1 'How d
 python job_hunter.py --db /tmp/jobs-demo.sqlite3 interview-questions
 ```
 
-The match output includes evidence snippets for Python and SQL and lists Docker as unmentioned. Data remains in the local database; resume files are read locally.
+The match output includes evidence snippets for Python and SQL and lists Docker as unmentioned. Match either a local resume file or a saved version with `python job_hunter.py --db /tmp/jobs-demo.sqlite3 match 1 --resume-version 1`; saved versions can be listed with `resume-list`. Data remains in the local database; resume files are read locally.
 
 ## Search HH.ru
 
@@ -56,7 +56,7 @@ Public vacancy search is a read-only anonymous request and needs no credentials.
 python job_hunter.py --db /tmp/jobs-demo.sqlite3 hh-search 'аналитик данных' --page 0
 ```
 
-Add `--save` only when you want the returned vacancies stored in the selected database. The search uses one page per request, an identifying User-Agent, bounded retries for 429/5xx and transient network errors, and honors `Retry-After` up to 30 seconds. Results expose HH publication time and local fetch time; saved vacancies retain publication time. See the [HH.ru vacancy API](https://github.com/hhru/api/blob/master/docs/vacancies.md).
+Add `--save` only when you want the returned vacancies stored in the selected database. The search uses one page per request, an identifying User-Agent, bounded retries for 429/5xx and transient network errors, and honors `Retry-After` up to 30 seconds. Successful search pages are cached for five minutes in the selected local database. Results expose HH publication time and local fetch time; repeated URL saves reuse the existing vacancy. See the [HH.ru vacancy API](https://github.com/hhru/api/blob/master/docs/vacancies.md).
 
 ## Tests and CI
 

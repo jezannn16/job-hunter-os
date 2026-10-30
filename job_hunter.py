@@ -83,6 +83,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
       due_at TEXT NOT NULL, note TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS follow_up_reminders(task_id INTEGER NOT NULL REFERENCES follow_up_tasks(id) ON DELETE CASCADE,
       reminder_date TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(task_id,reminder_date));
+    CREATE TABLE IF NOT EXISTS hh_search_cache(cache_key TEXT PRIMARY KEY, expires_at REAL NOT NULL, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
       body TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_vacancy_title ON vacancies(title);
@@ -100,6 +101,24 @@ def add_vacancy(
     title, company = title.strip(), company.strip()
     if not title or not company:
         raise ValueError("Title and company are required")
+    clean_url = url.strip()
+    if clean_url:
+        parsed_url = urllib.parse.urlsplit(clean_url)
+        identity_url = urllib.parse.urlunsplit(
+            (parsed_url.scheme.casefold(), parsed_url.netloc.casefold(), parsed_url.path.rstrip("/"), parsed_url.query, "")
+        ).casefold()
+        duplicate = db.execute(
+            "SELECT v.id FROM vacancies v WHERE lower(rtrim(v.url,'/'))=? ORDER BY v.id LIMIT 1",
+            (identity_url,),
+        ).fetchone()
+    else:
+        duplicate = db.execute(
+            "SELECT v.id FROM vacancies v JOIN companies c ON c.id=v.company_id "
+            "WHERE v.url='' AND lower(v.title)=lower(?) AND lower(c.name)=lower(?) ORDER BY v.id LIMIT 1",
+            (title, company),
+        ).fetchone()
+    if duplicate:
+        return int(duplicate[0])
     cur = db.execute(
         "INSERT INTO companies(name) VALUES(?) ON CONFLICT(name) DO UPDATE SET name=excluded.name", (company,)
     )
@@ -258,12 +277,28 @@ class HHSource:
     cache_seconds: float = 300.0
     max_attempts: int = 3
     backoff_seconds: float = 0.25
+    cache_db: sqlite3.Connection | None = field(default=None, repr=False, compare=False)
     _cache: dict[tuple[str, int], tuple[float, list[dict[str, str]]]] = field(default_factory=dict, repr=False)
 
     def search(self, text: str, page: int = 0) -> list[dict[str, str]]:
         if not text.strip() or page < 0:
             raise ValueError("Search text and a non-negative page are required")
         key = (text.strip(), page)
+        persistent_key = json.dumps(key, ensure_ascii=False, separators=(",", ":"))
+        if self.cache_db is not None:
+            cached_row = self.cache_db.execute(
+                "SELECT expires_at,payload FROM hh_search_cache WHERE cache_key=?", (persistent_key,)
+            ).fetchone()
+            if cached_row and float(cached_row["expires_at"]) > time.time():
+                try:
+                    cached_payload = json.loads(cached_row["payload"])
+                except json.JSONDecodeError:
+                    cached_payload = None
+                if isinstance(cached_payload, list) and all(isinstance(row, dict) for row in cached_payload):
+                    return [dict(row) for row in cached_payload]
+                self.cache_db.execute("DELETE FROM hh_search_cache WHERE cache_key=?", (persistent_key,))
+            elif cached_row:
+                self.cache_db.execute("DELETE FROM hh_search_cache WHERE cache_key=?", (persistent_key,))
         cached = self._cache.get(key)
         if cached and cached[0] > time.monotonic():
             return [dict(row) for row in cached[1]]
@@ -299,6 +334,12 @@ class HHSource:
                 }
             )
         self._cache[key] = (time.monotonic() + self.cache_seconds, results)
+        if self.cache_db is not None:
+            self.cache_db.execute(
+                "INSERT INTO hh_search_cache(cache_key,expires_at,payload) VALUES(?,?,?) "
+                "ON CONFLICT(cache_key) DO UPDATE SET expires_at=excluded.expires_at,payload=excluded.payload",
+                (persistent_key, time.time() + self.cache_seconds, json.dumps(results, ensure_ascii=False)),
+            )
         return [dict(row) for row in results]
 
     def _request_json(self, req: urllib.request.Request) -> dict[str, object]:
@@ -360,7 +401,8 @@ def main() -> int:
     p.add_argument("--url", default="")
     p = sub.add_parser("match")
     p.add_argument("id", type=int)
-    p.add_argument("resume_file")
+    p.add_argument("resume_file", nargs="?")
+    p.add_argument("--resume-version", type=int, help="Use a saved resume version ID")
     p = sub.add_parser("hh-search")
     p.add_argument("query")
     p.add_argument("--page", type=int, default=0)
@@ -408,7 +450,10 @@ def main() -> int:
     db = connect(args.db)
     try:
         if args.cmd == "add":
-            print(f"Saved vacancy #{add_vacancy(db, args.title, args.company, args.url, args.description)}")
+            before = db.total_changes
+            vacancy_id = add_vacancy(db, args.title, args.company, args.url, args.description)
+            label = "Already tracked" if db.total_changes == before else "Saved vacancy"
+            print(f"{label} #{vacancy_id}")
         elif args.cmd == "list":
             for x in list_vacancies(db, args.search, args.status):
                 print(
@@ -425,24 +470,40 @@ def main() -> int:
             row = db.execute("SELECT description FROM vacancies WHERE id=?", (args.id,)).fetchone()
             if not row:
                 raise ValueError("Vacancy not found")
+            if args.resume_version is not None:
+                if args.resume_file:
+                    raise ValueError("Choose either a resume file or --resume-version, not both")
+                resume_row = db.execute(
+                    "SELECT content FROM resume_versions WHERE id=?", (args.resume_version,)
+                ).fetchone()
+                if resume_row is None:
+                    raise ValueError("Resume version not found")
+                resume_content = resume_row["content"]
+            elif args.resume_file:
+                resume_content = Path(args.resume_file).read_text(encoding="utf-8")
+            else:
+                raise ValueError("Provide a resume file or --resume-version ID")
             print(
                 json.dumps(
-                    match_resume(row[0], Path(args.resume_file).read_text(encoding="utf-8")),
+                    match_resume(row[0], resume_content),
                     ensure_ascii=False,
                     indent=2,
                 )
             )
         elif args.cmd == "hh-search":
-            results = HHSource().search(args.query, args.page)
+            results = HHSource(cache_db=db).search(args.query, args.page)
             for i, x in enumerate(results, 1):
                 print(
                     f"{i}. {x['title']} — {x['company']} | {x['url']} "
                     f"[published {x['published_at'] or 'unknown'}; fetched {x['fetched_at']}]"
                 )
                 if args.save:
-                        add_vacancy(
+                        before = db.total_changes
+                        vacancy_id = add_vacancy(
                             db, x["title"], x["company"], x["url"], x["description"], x["source"], x["published_at"]
                         )
+                        if db.total_changes == before:
+                            print(f"   Already tracked as #{vacancy_id}")
         elif args.cmd == "resume-add":
             content = Path(args.file).read_text(encoding="utf-8")
             if not content.strip():

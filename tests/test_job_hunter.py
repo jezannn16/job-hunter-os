@@ -48,6 +48,16 @@ def test_invalid_data_and_status(tmp_path):
         set_status(db, 404, "offer")
 
 
+def test_vacancy_add_is_idempotent_for_url_and_manual_company_title(tmp_path):
+    db = connect(tmp_path / "jobs.db")
+    first = add_vacancy(db, "Engineer", "Acme")
+    assert add_vacancy(db, " engineer ", "ACME") == first
+    linked = add_vacancy(db, "Data Engineer", "Another Co", "https://jobs.example/role/1/")
+    assert add_vacancy(db, "Different title", "Different Co", "https://jobs.example/role/1") == linked
+    assert db.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0] == 2
+    assert db.execute("SELECT COUNT(*) FROM applications").fetchone()[0] == 2
+
+
 def test_status_transition_is_constrained_and_audited(tmp_path):
     db = connect(tmp_path / "jobs.db")
     vacancy = add_vacancy(db, "Engineer", "Acme")
@@ -265,3 +275,42 @@ def test_hh_malformed_payload_fails_with_actionable_service_error(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
     with pytest.raises(TypeError, match="invalid employer"):
         HHSource().search("python")
+
+
+def test_hh_cache_survives_source_and_database_recreation(tmp_path):
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def read(self, _limit):
+            return json.dumps({"items": [{"name": "Engineer", "employer": {"name": "Acme"},
+                "alternate_url": "https://hh.ru/vacancy/1", "published_at": "2026-10-30T09:00:00+0300"}]}).encode()
+
+    cache_path = tmp_path / "jobs.db"
+    db = connect(cache_path)
+    with patch("urllib.request.urlopen", return_value=Response()) as fetch:
+        first = HHSource(cache_db=db).search("Python", page=1)
+    db.commit()
+    db.close()
+    assert fetch.call_count == 1
+
+    reopened = connect(cache_path)
+    with patch("urllib.request.urlopen", side_effect=AssertionError("cache should avoid network")):
+        cached = HHSource(cache_db=reopened).search("Python", page=1)
+    assert cached == first
+    reopened.close()
+
+
+def test_match_can_select_a_saved_resume_version_in_cli(tmp_path):
+    project = Path(__file__).resolve().parents[1]
+    database = tmp_path / "jobs.db"
+    resume = tmp_path / "resume.txt"
+    resume.write_text("Опыт: Python и SQL в ETL-проектах.", encoding="utf-8")
+
+    def cli(*args):
+        return subprocess.run([sys.executable, "job_hunter.py", "--db", str(database), *args],
+            cwd=project, check=True, capture_output=True, text=True).stdout
+
+    cli("add", "Data Engineer", "Acme", "--description", "Обязательно: Python и SQL")
+    cli("resume-add", "2026 CV", str(resume))
+    result = json.loads(cli("match", "1", "--resume-version", "1"))
+    assert set(result["matched"]) == {"python", "sql"}
